@@ -1,0 +1,14 @@
+# Создать плейбуки
+/usr/local/bin/automated_incident_response.sh --create-playbooks
+
+# Запустить тестовые сценарии
+/usr/local/bin/automated_incident_response.sh --test
+
+# Показать статус
+/usr/local/bin/automated_incident_response.sh --status
+
+# Ответить на конкретный инцидент
+/usr/local/bin/automated_incident_response.sh --respond brute_force ip=192.168.1.100 0.9
+
+# Откатить действия
+/usr/local/bin/automated_incident_response.sh --rollback
