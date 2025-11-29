@@ -1,0 +1,323 @@
+#!/bin/bash
+
+# =============================================================================
+# ЕЖЕДНЕВНЫЙ АУДИТ БЕЗОПАСНОСТИ LINUX
+# Автор: Security Team
+# Версия: 1.1
+# =============================================================================
+
+# Конфигурация
+LOG_DIR="/var/log/security_audit"
+REPORT_FILE="$LOG_DIR/security_audit_$(date +%Y%m%d_%H%M%S).log"
+TEMP_FILE="/tmp/security_audit_temp.log"
+SCORE=100  # Начальный балл безопасности
+
+# Цветовое оформление
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Функции для вывода
+print_critical() {
+    echo -e "${RED}[CRITICAL] $1${NC}" | tee -a $TEMP_FILE
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING] $1${NC}" | tee -a $TEMP_FILE
+}
+
+print_info() {
+    echo -e "${BLUE}[INFO] $1${NC}" | tee -a $TEMP_FILE
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS] $1${NC}" | tee -a $TEMP_FILE
+}
+
+# Создание директории для логов
+mkdir -p $LOG_DIR
+
+# Очистка временного файла
+> $TEMP_FILE
+
+echo "=== ОТЧЕТ АУДИТА БЕЗОПАСНОСТИ ===" | tee $TEMP_FILE
+echo "Дата: $(date)" | tee -a $TEMP_FILE
+echo "Система: $(hostname)" | tee -a $TEMP_FILE
+echo "==================================" | tee -a $TEMP_FILE
+
+# =============================================================================
+# 1. ПРОВЕРКА ОБНОВЛЕНИЙ СИСТЕМЫ
+# =============================================================================
+echo -e "\n--- 1. ПРОВЕРКА ОБНОВЛЕНИЙ СИСТЕМЫ ---" | tee -a $TEMP_FILE
+
+if command -v apt-get &> /dev/null; then
+    # Debian/Ubuntu системы
+    updates=$(apt-get -s dist-upgrade | grep -E '^Inst' | wc -l)
+    security_updates=$(apt-get -s dist-upgrade | grep -E '^Inst' | grep -i security | wc -l)
+    
+    print_info "Доступно обновлений: $updates"
+    print_info "Обновлений безопасности: $security_updates"
+    
+    if [ $security_updates -gt 0 ]; then
+        print_critical "Найдены критические обновления безопасности!"
+        SCORE=$((SCORE - 10))
+    elif [ $updates -gt 0 ]; then
+        print_warning "Доступны обычные обновления системы"
+        SCORE=$((SCORE - 5))
+    else
+        print_success "Система актуальна"
+    fi
+
+elif command -v yum &> /dev/null; then
+    # RedHat/CentOS системы
+    updates=$(yum check-update --security 2>/dev/null | grep -E '^\w' | wc -l)
+    print_info "Доступно обновлений безопасности: $updates"
+    
+    if [ $updates -gt 0 ]; then
+        print_critical "Найдены обновления безопасности!"
+        SCORE=$((SCORE - 10))
+    else
+        print_success "Система актуальна"
+    fi
+else
+    print_warning "Не удалось определить менеджер пакетов"
+fi
+
+# =============================================================================
+# 2. АУДИТ ПОЛЬЗОВАТЕЛЕЙ И ПРАВ
+# =============================================================================
+echo -e "\n--- 2. АУДИТ ПОЛЬЗОВАТЕЛЕЙ И ПРАВ ---" | tee -a $TEMP_FILE
+
+# Пользователи с UID 0 (кроме root)
+echo "Пользователи с UID 0:" | tee -a $TEMP_FILE
+uid_zero_users=$(awk -F: '($3 == 0) {print $1}' /etc/passwd)
+found_non_root=0
+
+for user in $uid_zero_users; do
+    if [ "$user" != "root" ]; then
+        print_critical "Не root пользователь с UID 0: $user"
+        SCORE=$((SCORE - 15))
+        found_non_root=1
+    fi
+done
+
+if [ $found_non_root -eq 0 ]; then
+    print_success "Только root имеет UID 0"
+fi
+
+# Пользователи с пустыми паролями
+empty_password_users=$(awk -F: '($2 == "") {print $1}' /etc/shadow 2>/dev/null)
+if [ -n "$empty_password_users" ]; then
+    print_critical "Пользователи с пустыми паролями: $empty_password_users"
+    SCORE=$((SCORE - 20))
+else
+    print_success "Нет пользователей с пустыми паролями"
+fi
+
+# Пользователи без пароля (использующие /bin/false или /usr/sbin/nologin)
+nopassword_users=$(awk -F: '($2 == "!" || $2 == "*") {print $1}' /etc/shadow 2>/dev/null)
+if [ -n "$nopassword_users" ]; then
+    print_warning "Пользователи с заблокированными паролями: $nopassword_users"
+fi
+
+# Последние входы
+echo "Последние 10 входов в систему:" | tee -a $TEMP_FILE
+last -n 10 | head -10 | tee -a $TEMP_FILE
+
+# =============================================================================
+# 3. СЕТЕВЫЕ СЛУЖБЫ
+# =============================================================================
+echo -e "\n--- 3. АНАЛИЗ СЕТЕВЫХ СЛУЖБ ---" | tee -a $TEMP_FILE
+
+# Открытые порты
+print_info "Открытые сетевые порты:"
+if command -v netstat &> /dev/null; then
+    netstat -tulpn | grep LISTEN | tee -a $TEMP_FILE
+elif command -v ss &> /dev/null; then
+    ss -tulpn | grep LISTEN | tee -a $TEMP_FILE
+else
+    print_warning "Не удалось найти netstat или ss"
+fi
+
+# Нежелательные службы
+unwanted_services=("telnet" "rsh" "rlogin" "rexec" "tftp" "vsftpd")
+for service in "${unwanted_services[@]}"; do
+    if systemctl is-active --quiet $service 2>/dev/null || pgrep -x $service &>/dev/null; then
+        print_critical "Нежелательная служба активна: $service"
+        SCORE=$((SCORE - 10))
+    fi
+done
+
+# Проверка SSH конфигурации
+if command -v sshd &> /dev/null; then
+    if sshd -t 2>/dev/null; then
+        print_success "SSH конфигурация корректна"
+    else
+        print_critical "Ошибка в SSH конфигурации!"
+        SCORE=$((SCORE - 10))
+    fi
+else
+    print_warning "SSH сервер не установлен"
+fi
+
+# =============================================================================
+# 4. ФАЙЛОВАЯ СИСТЕМА
+# =============================================================================
+echo -e "\n--- 4. АУДИТ ФАЙЛОВОЙ СИСТЕМЫ ---" | tee -a $TEMP_FILE
+
+# Файлы с SUID битом
+print_info "Файлы с SUID битом:"
+find / -xdev -perm -4000 -type f 2>/dev/null | head -20 | tee -a $TEMP_FILE
+
+# Файлы с SGID битом
+print_info "Файлы с SGID битом:"
+find / -xdev -perm -2000 -type f 2>/dev/null | head -20 | tee -a $TEMP_FILE
+
+# Файлы с мировой записью
+print_info "Файлы с мировой записью:"
+find / -xdev -perm -o=w -type f ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" 2>/dev/null | head -20 | tee -a $TEMP_FILE
+
+# Проверка точек монтирования с опасными опциями
+print_info "Опасные точки монтирования:"
+mount | grep -E '(noexec|nosuid|nodev)' | tee -a $TEMP_FILE
+
+# =============================================================================
+# 5. АНАЛИЗ ЛОГОВ
+# =============================================================================
+echo -e "\n--- 5. АНАЛИЗ ЛОГОВ БЕЗОПАСНОСТИ ---" | tee -a $TEMP_FILE
+
+# Неудачные попытки входа
+print_info "Последние неудачные попытки входа:"
+if [ -f "/var/log/auth.log" ]; then
+    grep "Failed password" /var/log/auth.log | tail -10 | tee -a $TEMP_FILE
+elif [ -f "/var/log/secure" ]; then
+    grep "Failed password" /var/log/secure | tail -10 | tee -a $TEMP_FILE
+else
+    print_warning "Файл аутентификации не найден"
+fi
+
+# Подозрительная активность
+print_info "Последние успешные входы:"
+if [ -f "/var/log/auth.log" ]; then
+    grep "session opened" /var/log/auth.log | tail -5 | tee -a $TEMP_FILE
+elif [ -f "/var/log/secure" ]; then
+    grep "session opened" /var/log/secure | tail -5 | tee -a $TEMP_FILE
+fi
+
+# Попытки повышения привилегий
+print_info "Использование sudo:"
+if [ -f "/var/log/auth.log" ]; then
+    grep "sudo:" /var/log/auth.log | tail -5 | tee -a $TEMP_FILE
+fi
+
+# =============================================================================
+# 6. ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ
+# =============================================================================
+echo -e "\n--- 6. ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ ---" | tee -a $TEMP_FILE
+
+# Проверка настроек firewall
+print_info "Статус firewall:"
+if command -v ufw &> /dev/null; then
+    ufw status verbose | tee -a $TEMP_FILE
+elif command -v firewall-cmd &> /dev/null; then
+    firewall-cmd --state | tee -a $TEMP_FILE
+elif command -v iptables &> /dev/null; then
+    iptables -L -n | head -20 | tee -a $TEMP_FILE
+else
+    print_warning "Firewall не настроен или не обнаружен"
+    SCORE=$((SCORE - 10))
+fi
+
+# Проверка настроек SELinux/AppArmor
+print_info "Статус SELinux/AppArmor:"
+if command -v sestatus &> /dev/null; then
+    sestatus | tee -a $TEMP_FILE
+elif command -v aa-status &> /dev/null; then
+    aa-status | tee -a $TEMP_FILE
+else
+    print_warning "SELinux/AppArmor не активен"
+    SCORE=$((SCORE - 5))
+fi
+
+# Проверка настроек sysctl
+print_info "Важные настройки ядра:"
+important_settings=(
+    "net.ipv4.ip_forward"
+    "net.ipv4.conf.all.accept_redirects"
+    "net.ipv4.conf.all.accept_source_route"
+    "net.ipv4.conf.all.log_martians"
+    "kernel.randomize_va_space"
+)
+
+for setting in "${important_settings[@]}"; do
+    value=$(sysctl -n $setting 2>/dev/null)
+    if [ -n "$value" ]; then
+        echo "$setting = $value" | tee -a $TEMP_FILE
+    fi
+done
+
+# =============================================================================
+# ОЦЕНКА БЕЗОПАСНОСТИ
+# =============================================================================
+echo -e "\n--- ОЦЕНКА БЕЗОПАСНОСТИ ---" | tee -a $TEMP_FILE
+
+# Корректировка баллов (не ниже 0)
+if [ $SCORE -lt 0 ]; then
+    SCORE=0
+elif [ $SCORE -gt 100 ]; then
+    SCORE=100
+fi
+
+# Определение буквенной оценки
+if [ $SCORE -ge 90 ]; then
+    GRADE="A"
+    COLOR=$GREEN
+elif [ $SCORE -ge 80 ]; then
+    GRADE="B"
+    COLOR=$GREEN
+elif [ $SCORE -ge 70 ]; then
+    GRADE="C"
+    COLOR=$YELLOW
+elif [ $SCORE -ge 60 ]; then
+    GRADE="D"
+    COLOR=$YELLOW
+else
+    GRADE="F"
+    COLOR=$RED
+fi
+
+echo -e "${COLOR}Балл безопасности: $SCORE/100${NC}" | tee -a $TEMP_FILE
+echo -e "${COLOR}Оценка: $GRADE${NC}" | tee -a $TEMP_FILE
+
+# Рекомендации
+echo -e "\n--- РЕКОМЕНДАЦИИ ---" | tee -a $TEMP_FILE
+if [ $SCORE -lt 70 ]; then
+    print_critical "Требуется немедленное внимание к системе безопасности!"
+    echo "Рекомендуемые действия:" | tee -a $TEMP_FILE
+    echo "1. Установить обновления безопасности" | tee -a $TEMP_FILE
+    echo "2. Настроить firewall" | tee -a $TEMP_FILE
+    echo "3. Проверить пользователей и права доступа" | tee -a $TEMP_FILE
+    echo "4. Аудит SUID/SGID файлов" | tee -a $TEMP_FILE
+elif [ $SCORE -lt 80 ]; then
+    print_warning "Рекомендуется улучшить безопасность системы"
+    echo "Рекомендуемые действия:" | tee -a $TEMP_FILE
+    echo "1. Установить обновления" | tee -a $TEMP_FILE
+    echo "2. Проверить настройки безопасности" | tee -a $TEMP_FILE
+else
+    print_success "Система в хорошем состоянии безопасности"
+    echo "Рекомендуется поддерживать текущий уровень безопасности" | tee -a $TEMP_FILE
+fi
+
+# Сохранение отчета
+cp $TEMP_FILE $REPORT_FILE
+echo -e "\nОтчет сохранен: $REPORT_FILE" | tee -a $TEMP_FILE
+
+# Очистка старых отчетов (храним 30 дней)
+find $LOG_DIR -name "security_audit_*.log" -mtime +30 -delete 2>/dev/null
+
+print_success "Аудит безопасности завершен"
+
+# Очистка временного файла
+rm -f $TEMP_FILE
