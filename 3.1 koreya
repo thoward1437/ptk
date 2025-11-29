@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# event_correlator.sh: Корреляция событий
+NORMALIZED_FILE="/opt/security_system/normalized_logs.json"
+CORRELATION_FILE="/opt/security_system/correlations.txt"
+WORKING_HOURS_START="09:00"
+WORKING_HOURS_END="18:00"
+
+# Функция логирования
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [CORRELATOR] $1" >> /var/log/security_correlator.log
+}
+
+# Очищаем старый файл
+> "$CORRELATION_FILE"
+
+log "Starting correlation"
+
+# Читаем нормализованные логи
+jq -c '.[]' "$NORMALIZED_FILE" | while read -r event; do
+    timestamp=$(echo "$event" | jq -r '.timestamp')
+    host=$(echo "$event" | jq -r '.host')
+    message=$(echo "$event" | jq -r '.message')
+
+    # Time-based correlation: Атаки вне рабочего времени
+    event_time=$(date -d "$timestamp" '+%H:%M')
+    if [[ "$event_time" < "$WORKING_HOURS_START" || "$event_time" > "$WORKING_HOURS_END" ]]; then
+        if echo "$message" | grep -qi "failed\|attack\|brute"; then
+            echo "Time-based alert: Attack outside working hours - $timestamp $host $message" >> "$CORRELATION_FILE"
+        fi
+    fi
+
+    # Coordinated attacks: Множественные IP с похожими паттернами (brute-force)
+    if echo "$message" | grep -qi "invalid user\|authentication failure"; then
+        ip=$(echo "$message" | grep -oP '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b' | head -1)
+        if [[ -n "$ip" ]]; then
+            # Проверяем, есть ли другие события от этого IP в последние 10 мин
+            recent_events=$(jq -c "select(.timestamp | strptime(\"%Y-%m-%dT%H:%M:%S\") | mktime > $(date -d '10 minutes ago' +%s)) | select(.message | test(\"$ip\"))" "$NORMALIZED_FILE" | wc -l)
+            if (( recent_events > 5 )); then
+                echo "Coordinated attack: Multiple failures from $ip - $timestamp $host" >> "$CORRELATION_FILE"
+            fi
+        fi
+    fi
+
+    # Lateral movement: Последовательные доступы к разным хостам
+    user=$(echo "$message" | grep -oP 'user \w+' | awk '{print $2}')
+    if [[ -n "$user" ]]; then
+        # Проверяем последовательность (упрощено: если пользователь логинится на разные хосты подряд)
+        prev_hosts=$(jq -r "select(.message | test(\"$user\")) | .host" "$NORMALIZED_FILE" | sort | uniq | tail -5)
+        if (( $(echo "$prev_hosts" | wc -l) > 2 )); then
+            echo "Lateral movement: User $user accessing multiple hosts - $timestamp $host" >> "$CORRELATION_FILE"
+        fi
+    fi
+
+    # Privilege escalation: Паттерны sudo/su с подозрительными действиями
+    if echo "$message" | grep -qi "sudo\|su.*root"; then
+        next_events=$(jq -c "select(.timestamp > \"$timestamp\") | .message" "$NORMALIZED_FILE" | head -3)
+        if echo "$next_events" | grep -qi "chmod\|rm\|kill"; then
+            echo "Privilege escalation: Suspicious actions after sudo - $timestamp $host $message" >> "$CORRELATION_FILE"
+        fi
+    fi
+done
+
+log "Correlation complete"
