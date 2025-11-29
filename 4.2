@@ -1,0 +1,198 @@
+#!/bin/bash
+
+while true; do
+  clear
+  echo "=== Панель безопасности ==="
+  echo "Время: $(date)"
+  echo "--------------------------"
+
+  echo -e "\033[1;34m[События безопасности]\033[0m"
+  journalctl -n 5 -p warning --no-pager
+
+  echo -e "\033[1;32m[Состояние системы]\033[0m"
+  top -b -n 1 | head -n 5
+
+  echo -e "\033[1;36m[Сетевой трафик]\033[0m"
+  ss -tunap | head -n 5
+
+  # Пример цветового индикатора угроз:
+  threat_count=$(journalctl -p warning | grep "failed password" | wc -l)
+  if (( threat_count > 10 )); then
+    echo -e "\033[41;97m ВЫСОКИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  elif (( threat_count > 3 )); then
+    echo -e "\033[43;30m СРЕДНИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  else
+    echo -e "\033[42;30m НИЗКИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  fi
+
+  echo -e "\033[1;33m[Действия]\033[0m"
+  echo "1) Заблокировать IP  2) Перезапустить сервис  3) Экспорт отчёта"
+  read -t 5 -n 1 choice
+
+  case $choice in
+    1) 
+      echo "Введите IP для блокировки:"
+      read ip
+      sudo iptables -A INPUT -s $ip -j DROP
+      echo "IP $ip заблокирован"
+      sleep 2
+      ;;
+    2) 
+      echo "Введите имя сервиса для перезапуска:"
+      read svc
+      sudo systemctl restart $svc
+      echo "Сервис $svc перезапущен"
+      sleep 2
+      ;;
+    3) 
+      journalctl -p warning > report_$(date +%F).txt
+      echo "Отчёт сохранён в report_$(date +%F).txt"
+      sleep 2
+      ;;
+  esac
+done
+import yaml
+import logging
+import subprocess
+import smtplib
+from email.mime.text import MIMEText
+import os
+from datetime import datetime
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/air_system.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class Logger:
+    @staticmethod
+    def log(level, message):
+        getattr(logging, level)(message)
+
+class ActionExecutor:
+    def __init__(self):
+        self.rollback_stack = []  # Стек для отката
+
+    def execute(self, action, params, rollback_action=None):
+        Logger.log('info', f"Executing action: {action} with params: {params}")
+        try:
+            if action == 'block_ip':
+                # Симуляция блокировки IP (в реальности: iptables или firewall)
+                subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-s', params['ip'], '-j', 'DROP'], check=True)
+                if rollback_action:
+                    self.rollback_stack.append(('unblock_ip', {'ip': params['ip']}))
+            elif action == 'unblock_ip':
+                subprocess.run(['sudo', 'iptables', '-D', 'INPUT', '-s', params['ip'], '-j', 'DROP'], check=True)
+            elif action == 'isolate_process':
+                # Симуляция изоляции (kill и dump)
+                subprocess.run(['kill', '-STOP', params['pid']], check=True)  # Pause process
+                subprocess.run(['gcore', params['pid']], check=True)  # Memory dump (Linux tool)
+                if rollback_action:
+                    self.rollback_stack.append(('resume_process', {'pid': params['pid']}))
+            elif action == 'resume_process':
+                subprocess.run(['kill', '-CONT', params['pid']], check=True)
+            elif action == 'quarantine_file':
+                # Перемещение в карантин
+                os.rename(params['file'], f"/quarantine/{os.path.basename(params['file'])}")
+                if rollback_action:
+                    self.rollback_stack.append(('restore_file', {'file': params['file']}))
+            elif action == 'restore_file':
+                os.rename(f"/quarantine/{os.path.basename(params['file'])}", params['file'])
+            elif action == 'restore_from_backup':
+                # Симуляция восстановления из backup
+                subprocess.run(['cp', f"/backup/{os.path.basename(params['file'])}", params['file']], check=True)
+            elif action == 'kill_process':
+                subprocess.run(['kill', '-9', params['pid']], check=True)
+            elif action == 'block_pools':
+                # Симуляция блокировки пулов (добавление в hosts)
+                with open('/etc/hosts', 'a') as f:
+                    f.write(f"127.0.0.1 {params['pool']}\n")
+                if rollback_action:
+                    self.rollback_stack.append(('unblock_pools', {'pool': params['pool']}))
+            elif action == 'unblock_pools':
+                # Удаление из hosts (упрощено)
+                pass  # В реальности: sed или редактирование файла
+            elif action == 'notify':
+                Logger.log('info', f"Notification: {params['message']}")
+            else:
+                raise ValueError(f"Unknown action: {action}")
+        except Exception as e:
+            Logger.log('error', f"Failed to execute {action}: {e}")
+            raise
+
+    def rollback(self):
+        Logger.log('info', "Rolling back actions")
+        while self.rollback_stack:
+            action, params = self.rollback_stack.pop()
+            self.execute(action, params, rollback_action=None)
+
+class EscalationHandler:
+    @staticmethod
+    def escalate(message, confidence):
+        Logger.log('warning', f"Escalating due to low confidence ({confidence}): {message}")
+        # Симуляция отправки email (замените на реальные credentials)
+        msg = MIMEText(f"Incident escalation: {message}")
+        msg['Subject'] = 'AIR Escalation'
+        msg['From'] = 'air@system.com'
+        msg['To'] = 'operator@company.com'
+        try:
+            server = smtplib.SMTP('smtp.example.com', 587)
+            server.starttls()
+            server.login('username', 'password')
+            server.sendmail(msg['From'], [msg['To']], msg.as_string())
+            server.quit()
+        except Exception as e:
+            Logger.log('error', f"Failed to send escalation email: {e}")
+
+class PlaybookEngine:
+    def __init__(self):
+        self.executor = ActionExecutor()
+        self.escalator = EscalationHandler()
+
+    def load_playbook(self, playbook_path):
+        with open(playbook_path, 'r') as f:
+            return yaml.safe_load(f)
+
+    def run_playbook(self, playbook, context, confidence=1.0):
+        Logger.log('info', f"Running playbook: {playbook['name']}")
+        if confidence < playbook.get('confidence_threshold', 0.5):
+            self.escalator.escalate(playbook['description'], confidence)
+            return  # Ожидание подтверждения от оператора (в реальности: асинхронно)
+
+        for step in playbook['steps']:
+            action = step['action']
+            params = {k: v.replace('{{', '').replace('}}', '') for k, v in step['params'].items()}  # Простая подстановка
+            params = {k: context.get(v, v) for k, v in params.items()}  # Замена из контекста
+            rollback = step.get('rollback')
+            self.executor.execute(action, params, rollback)
+
+class IncidentDetector:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def detect_and_respond(self, incident_type, context, confidence=1.0):
+        playbook_path = f"playbooks/{incident_type}.yaml"
+        if os.path.exists(playbook_path):
+            playbook = self.engine.load_playbook(playbook_path)
+            self.engine.run_playbook(playbook, context, confidence)
+        else:
+            Logger.log('error', f"No playbook found for {incident_type}")
+
+# Пример использования
+if name == "__main__":
+    engine = PlaybookEngine()
+    detector = IncidentDetector(engine)
+
+    # Симуляция обнаружения инцидентов
+    detector.detect_and_respond('brute_force', {'ip': '192.168.1.100'}, confidence=0.9)
+    detector.detect_and_respond('suspicious_process', {'pid': '1234'}, confidence=0.7)  # Эскалация
+    detector.detect_and_respond('critical_file_change', {'file': '/etc/passwd'}, confidence=1.0)
+    detector.detect_and_respond('crypto_miner', {'pid': '5678', 'pool': 'minerpool.com'}, confidence=1.0)
+
+    # Пример отката (при false positive)
+    engine.executor.rollback()
