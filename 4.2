@@ -1,147 +1,158 @@
-import yaml
-import logging
-import subprocess
-import smtplib
-from email.mime.text import MIMEText
-import os
-from datetime import datetime
+#!/bin/bash
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/air_system.log'),
-        logging.StreamHandler()
-    ]
-)
+# Automated Incident Response System (Bash version)
+# Требования: Bash 4+, sudo для команд (iptables, kill и т.д.), mail для эскалации
 
-class Logger:
-    @staticmethod
-    def log(level, message):
-        getattr(logging, level)(message)
+LOG_FILE="logs/air_system.log"
+declare -a rollback_stack  # Массив для отката
 
-class ActionExecutor:
-    def __init__(self):
-        self.rollback_stack = []  # Стек для отката
+# Функция логирования
+function log() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
 
-    def execute(self, action, params, rollback_action=None):
-        Logger.log('info', f"Executing action: {action} with params: {params}")
-        try:
-            if action == 'block_ip':
-                # Симуляция блокировки IP (в реальности: iptables или firewall)
-                subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-s', params['ip'], '-j', 'DROP'], check=True)
-                if rollback_action:
-                    self.rollback_stack.append(('unblock_ip', {'ip': params['ip']}))
-            elif action == 'unblock_ip':
-                subprocess.run(['sudo', 'iptables', '-D', 'INPUT', '-s', params['ip'], '-j', 'DROP'], check=True)
-            elif action == 'isolate_process':
-                # Симуляция изоляции (kill и dump)
-                subprocess.run(['kill', '-STOP', params['pid']], check=True)  # Pause process
-                subprocess.run(['gcore', params['pid']], check=True)  # Memory dump (Linux tool)
-                if rollback_action:
-                    self.rollback_stack.append(('resume_process', {'pid': params['pid']}))
-            elif action == 'resume_process':
-                subprocess.run(['kill', '-CONT', params['pid']], check=True)
-            elif action == 'quarantine_file':
-                # Перемещение в карантин
-                os.rename(params['file'], f"/quarantine/{os.path.basename(params['file'])}")
-                if rollback_action:
-                    self.rollback_stack.append(('restore_file', {'file': params['file']}))
-            elif action == 'restore_file':
-                os.rename(f"/quarantine/{os.path.basename(params['file'])}", params['file'])
-            elif action == 'restore_from_backup':
-                # Симуляция восстановления из backup
-                subprocess.run(['cp', f"/backup/{os.path.basename(params['file'])}", params['file']], check=True)
-            elif action == 'kill_process':
-                subprocess.run(['kill', '-9', params['pid']], check=True)
-            elif action == 'block_pools':
-                # Симуляция блокировки пулов (добавление в hosts)
-                with open('/etc/hosts', 'a') as f:
-                    f.write(f"127.0.0.1 {params['pool']}\n")
-                if rollback_action:
-                    self.rollback_stack.append(('unblock_pools', {'pool': params['pool']}))
-            elif action == 'unblock_pools':
-                # Удаление из hosts (упрощено)
-                pass  # В реальности: sed или редактирование файла
-            elif action == 'notify':
-                Logger.log('info', f"Notification: {params['message']}")
-            else:
-                raise ValueError(f"Unknown action: {action}")
-        except Exception as e:
-            Logger.log('error', f"Failed to execute {action}: {e}")
-            raise
+# Функция эскалации
+function escalate() {
+    local message="$1"
+    local confidence="$2"
+    log "warning" "Escalating due to low confidence ($confidence): $message"
+    # Отправка email (требует настройки mail; замените на реальный адрес)
+    echo "$message" | mail -s "AIR Escalation" operator@company.com 2>/dev/null || log "error" "Failed to send email"
+}
 
-    def rollback(self):
-        Logger.log('info', "Rolling back actions")
-        while self.rollback_stack:
-            action, params = self.rollback_stack.pop()
-            self.execute(action, params, rollback_action=None)
+# Функция выполнения действия с откатом
+function execute_action() {
+    local action="$1"
+    shift
+    log "info" "Executing action: $action with params: $@"
+    case "$action" in
+        block_ip)
+            local ip="$1"
+            sudo iptables -A INPUT -s "$ip" -j DROP
+            rollback_stack+=("sudo iptables -D INPUT -s $ip -j DROP")
+            ;;
+        unblock_ip)
+            local ip="$1"
+            sudo iptables -D INPUT -s "$ip" -j DROP
+            ;;
+        isolate_process)
+            local pid="$1"
+            kill -STOP "$pid"  # Pause
+            gcore "$pid" 2>/dev/null || log "error" "gcore failed for PID $pid"  # Memory dump
+            rollback_stack+=("kill -CONT $pid")
+            ;;
+        resume_process)
+            local pid="$1"
+            kill -CONT "$pid"
+            ;;
+        quarantine_file)
+            local file="$1"
+            sudo mv "$file" "/quarantine/$(basename "$file")"
+            rollback_stack+=("sudo mv /quarantine/$(basename "$file") $file")
+            ;;
+        restore_file)
+            local file="$1"
+            sudo mv "/quarantine/$(basename "$file")" "$file"
+            ;;
+        restore_from_backup)
+            local file="$1"
+            sudo cp "/backup/$(basename "$file")" "$file"
+            ;;
+        kill_process)
+            local pid="$1"
+            kill -9 "$pid"
+            ;;
+        block_pools)
+            local pool="$1"
+            echo "127.0.0.1 $pool" | sudo tee -a /etc/hosts >/dev/null
+            rollback_stack+=("sudo sed -i '/127.0.0.1 $pool/d' /etc/hosts")
+            ;;
+        unblock_pools)
+            local pool="$1"
+            sudo sed -i "/127.0.0.1 $pool/d" /etc/hosts
+            ;;
+        notify)
+            local msg="$1"
+            log "info" "Notification: $msg"
+            ;;
+        *)
+            log "error" "Unknown action: $action"
+            return 1
+            ;;
+    esac
+}
 
-class EscalationHandler:
-    @staticmethod
-    def escalate(message, confidence):
-        Logger.log('warning', f"Escalating due to low confidence ({confidence}): {message}")
-        # Симуляция отправки email (замените на реальные credentials)
-        msg = MIMEText(f"Incident escalation: {message}")
-        msg['Subject'] = 'AIR Escalation'
-        msg['From'] = 'air@system.com'
-        msg['To'] = 'operator@company.com'
-        try:
-            server = smtplib.SMTP('smtp.example.com', 587)
+# Функция запуска плейбука
+function run_playbook() {
+    local playbook_file="$1"
+    local context="$2"  # Простой формат: key=value,key2=value2
+    local confidence="$3"
 
-Андрюша 2, [29.11.2025 10:16]
-server.starttls()
-            server.login('username', 'password')
-            server.sendmail(msg['From'], [msg['To']], msg.as_string())
-            server.quit()
-        except Exception as e:
-            Logger.log('error', f"Failed to send escalation email: {e}")
+    # Загружаем плейбук
+    source "$playbook_file" 2>/dev/null || { log "error" "Failed to load playbook: $playbook_file"; return 1; }
 
-class PlaybookEngine:
-    def __init__(self):
-        self.executor = ActionExecutor()
-        self.escalator = EscalationHandler()
+    log "info" "Running playbook: $PLAYBOOK_NAME"
 
-    def load_playbook(self, playbook_path):
-        with open(playbook_path, 'r') as f:
-            return yaml.safe_load(f)
+    # Проверяем уверенность
+    if (( $(echo "$confidence < $CONFIDENCE_THRESHOLD" | bc -l) )); then
+        escalate "$PLAYBOOK_NAME" "$confidence"
+        return  # Эскалация (ожидание подтверждения; в реальности можно добавить паузу)
+    fi
 
-    def run_playbook(self, playbook, context, confidence=1.0):
-        Logger.log('info', f"Running playbook: {playbook['name']}")
-        if confidence < playbook.get('confidence_threshold', 0.5):
-            self.escalator.escalate(playbook['description'], confidence)
-            return  # Ожидание подтверждения от оператора (в реальности: асинхронно)
+    # Выполняем шаги (предполагаем функции step_1, step_2 и т.д.)
+    local step_num=1
+    while declare -f "step_$step_num" >/dev/null; do
+        # Парсим контекст (простая подстановка)
+        local params=""
+        IFS=',' read -ra KV <<< "$context"
+        for kv in "${KV[@]}"; do
+            IFS='=' read -r key value <<< "$kv"
+            params="$params $value"
+        done
+        "step_$step_num" $params
+        ((step_num++))
+    done
+}
 
-        for step in playbook['steps']:
-            action = step['action']
-            params = {k: v.replace('{{', '').replace('}}', '') for k, v in step['params'].items()}  # Простая подстановка
-            params = {k: context.get(v, v) for k, v in params.items()}  # Замена из контекста
-            rollback = step.get('rollback')
-            self.executor.execute(action, params, rollback)
+# Функция обнаружения и реагирования
+function detect_and_respond() {
+    local incident_type="$1"
+    local context="$2"
+    local confidence="${3:-1.0}"
+    local playbook_file="playbooks/${incident_type}.sh"
 
-class IncidentDetector:
-    def __init__(self, engine):
-        self.engine = engine
+    if [[ -f "$playbook_file" ]]; then
+        run_playbook "$playbook_file" "$context" "$confidence"
+    else
 
-    def detect_and_respond(self, incident_type, context, confidence=1.0):
-        playbook_path = f"playbooks/{incident_type}.yaml"
-        if os.path.exists(playbook_path):
-            playbook = self.engine.load_playbook(playbook_path)
-            self.engine.run_playbook(playbook, context, confidence)
-        else:
-            Logger.log('error', f"No playbook found for {incident_type}")
+Андрюша 2, [29.11.2025 10:21]
+log "error" "No playbook found for $incident_type"
+    fi
+}
 
-# Пример использования
-if name == "__main__":
-    engine = PlaybookEngine()
-    detector = IncidentDetector(engine)
+# Функция отката
+function rollback() {
+    log "info" "Rolling back actions"
+    for cmd in "${rollback_stack[@]}"; do
+        log "info" "Rollback: $cmd"
+        eval "$cmd"
+    done
+    rollback_stack=()  # Очищаем стек
+}
 
-    # Симуляция обнаружения инцидентов
-    detector.detect_and_respond('brute_force', {'ip': '192.168.1.100'}, confidence=0.9)
-    detector.detect_and_respond('suspicious_process', {'pid': '1234'}, confidence=0.7)  # Эскалация
-    detector.detect_and_respond('critical_file_change', {'file': '/etc/passwd'}, confidence=1.0)
-    detector.detect_and_respond('crypto_miner', {'pid': '5678', 'pool': 'minerpool.com'}, confidence=1.0)
+# Пример использования (симуляция обнаружения инцидентов)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Создаем карантин и backup папки, если нужно
+    sudo mkdir -p /quarantine /backup
+
+    detect_and_respond "brute_force" "ip=192.168.1.100" 0.9
+    detect_and_respond "suspicious_process" "pid=1234" 0.7  # Эскалация
+    detect_and_respond "critical_file_change" "file=/etc/passwd" 1.0
+    detect_and_respond "crypto_miner" "pid=5678,pool=minerpool.com" 1.0
 
     # Пример отката (при false positive)
-    engine.executor.rollback()
+    rollback
+fi
