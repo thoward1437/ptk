@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# web_visualizer.sh: Простой веб-сервер для визуализации
+PORT=8080
+HTML_FILE="/tmp/security_dashboard.html"
+
+# Генерация HTML
+generate_html() {
+    cat > "$HTML_FILE" <<EOF
+<!DOCTYPE html>
+<html>
+<head><title>Security Dashboard</title></head>
+<body>
+<h1>Security Events Dashboard</h1>
+<table border="1">
+<tr><th>Timestamp</th><th>Host</th><th>Program</th><th>Message</th><th>Event Type</th></tr>
+EOF
+
+    jq -r '.[] | "<tr><td>\$.timestamp)</td><td>\$.host)</td><td>\$.program)</td><td>\$.message)</td><td>\$.event_type)</td></tr>"' "/opt/security_system/normalized_logs.json" >> "$HTML_FILE"
+
+    cat >> "$HTML_FILE" <<EOF
+</table>
+<h2>Correlations</h2>
+<pre>$(cat /opt/security_system/correlations.txt)</pre>
+</body>
+</html>
+EOF
+}
+
+# Запуск сервера (использует netcat)
+generate_html
+while true; do
+    echo -e "HTTP/1.1 200 OK\nContent-Type: text/html\n\n$(cat $HTML_FILE)" | nc -l -p $PORT -q 1
+done
