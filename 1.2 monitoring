@@ -1,0 +1,285 @@
+#!/bin/bash
+
+# =============================================================================
+# СИСТЕМА МОНИТОРИНГА ЦЕЛОСТНОСТИ ФАЙЛОВ
+# =============================================================================
+
+# Конфигурация
+BASE_DIR="/opt/security"
+HASH_DB="$BASE_DIR/file_hashes.db"
+LOG_FILE="/var/log/file_integrity.log"
+ALERT_EMAIL="admin@company.com"
+
+# Создание директорий один раз при запуске
+mkdir -p "$BASE_DIR/backups"
+touch "$HASH_DB"
+touch "$LOG_FILE"
+
+# Список критических файлов для мониторинга
+CRITICAL_FILES=(
+    "/etc/passwd"
+    "/etc/shadow" 
+    "/etc/sudoers"
+    "/etc/ssh/sshd_config"
+    "/etc/hosts"
+    "/etc/crontab"
+    "/etc/fstab"
+    "/etc/group"
+    "/etc/gshadow"
+)
+
+# Директории для мониторинга
+CRITICAL_DIRS=(
+    "/bin"
+    "/usr/bin"
+    "/sbin" 
+    "/usr/sbin"
+    "/etc/init.d"
+)
+
+# Функция логирования
+log_message() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "$timestamp - $message" >> "$LOG_FILE"
+    logger -t "FileIntegrity" "$message"
+    echo "$timestamp - $message"  # Вывод в консоль
+}
+
+# Функция отправки уведомления
+send_alert() {
+    local file="$1"
+    local change_type="$2"
+    local old_hash="$3"
+    local new_hash="$4"
+    
+    local subject="[CRITICAL] Обнаружено изменение файла: $file"
+    local message="Файл: $file\nТип изменения: $change_type\nХеш до: $old_hash\nХеш после: $new_hash\nВремя: $(date)"
+    
+    # Проверяем наличие mail команды
+    if command -v mail &> /dev/null; then
+        echo -e "$message" | mail -s "$subject" "$ALERT_EMAIL"
+    else
+        log_message "WARNING: mail command not found, cannot send email alert"
+        # Выводим alert в консоль и лог
+        echo "ALERT: $subject"
+        echo -e "$message"
+    fi
+    log_message "ALERT: $subject"
+}
+
+# Функция создания эталонных хешей
+create_baseline() {
+    log_message "Создание эталонных хешей..."
+    
+    # Создаем временный файл для новых хешей
+    local temp_db=$(mktemp)
+    local file_count=0
+    
+    # Мониторинг отдельных файлов
+    for file in "${CRITICAL_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            hash=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+            if [ -n "$hash" ]; then
+                mtime=$(stat -c %Y "$file" 2>/dev/null || echo "0")
+                echo "$file|$hash|$mtime" >> "$temp_db"
+                ((file_count++))
+            else
+                log_message "WARNING: Не удалось вычислить хеш для: $file"
+            fi
+        else
+            log_message "WARNING: Файл не найден: $file"
+        fi
+    done
+    
+    # Мониторинг файлов в директориях
+    for dir in "${CRITICAL_DIRS[@]}"; do
+        if [ -d "$dir" ]; then
+            log_message "Обработка директории: $dir"
+            while IFS= read -r -d '' file; do
+                hash=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+                if [ -n "$hash" ]; then
+                    mtime=$(stat -c %Y "$file" 2>/dev/null || echo "0")
+                    echo "$file|$hash|$mtime" >> "$temp_db"
+                    ((file_count++))
+                fi
+            done < <(find "$dir" -type f -print0 2>/dev/null)
+            log_message "Завершена обработка директории: $dir"
+        else
+            log_message "WARNING: Директория не найдена: $dir"
+        fi
+    done
+    
+    # Заменяем старую базу новой
+    mv "$temp_db" "$HASH_DB"
+    log_message "Создание эталонных хешей завершено. Всего записей: $file_count"
+}
+
+# Функция проверки целостности
+check_integrity() {
+    log_message "Запуск проверки целостности файлов..."
+    local changes_detected=0
+    
+    # Проверяем существование базы хешей
+    if [ ! -f "$HASH_DB" ] || [ ! -s "$HASH_DB" ]; then
+        log_message "ERROR: База хешей не найдена или пуста. Запустите сначала: $0 baseline"
+        return 1
+    fi
+    
+    # Временный файл для новых хешей
+    local temp_db=$(mktemp)
+    
+    # Читаем оригинальную базу и проверяем файлы
+    while IFS='|' read -r file old_hash old_mtime; do
+        if [ -f "$file" ]; then
+            current_hash=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+            current_mtime=$(stat -c %Y "$file" 2>/dev/null || echo "0")
+            
+            # Сохраняем текущий хеш для следующей проверки
+            echo "$file|$current_hash|$current_mtime" >> "$temp_db"
+            
+            if [ -z "$current_hash" ]; then
+                log_message "WARNING: Не удалось вычислить хеш для: $file"
+                continue
+            fi
+            
+            if [ "$current_hash" != "$old_hash" ]; then
+                # Изменение содержимого
+                log_message "CONTENT_CHANGE: Изменен файл: $file"
+                send_alert "$file" "CONTENT_CHANGE" "$old_hash" "$current_hash"
+                backup_changed_file "$file"
+                changes_detected=1
+            elif [ "$current_mtime" != "$old_mtime" ]; then
+                # Изменение метаданных
+                log_message "METADATA_CHANGE: Изменены метаданные файла: $file"
+                send_alert "$file" "METADATA_CHANGE" "$old_hash" "$current_hash"
+                changes_detected=1
+            fi
+        else
+            # Файл удален
+            log_message "FILE_DELETED: Файл удален: $file"
+            send_alert "$file" "FILE_DELETED" "$old_hash" "N/A"
+            changes_detected=1
+        fi
+    done < "$HASH_DB"
+    
+    # Проверяем наличие новых файлов в мониторируемых директориях
+    log_message "Проверка новых файлов..."
+    
+    # Собираем все текущие файлы из мониторируемых путей
+    local current_files=$(mktemp)
+    
+    # Добавляем отдельные файлы
+    for file in "${CRITICAL_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            echo "$file" >> "$current_files"
+        fi
+    done
+    
+    # Добавляем файлы из директорий
+    for dir in "${CRITICAL_DIRS[@]}"; do
+        if [ -d "$dir" ]; then
+            while IFS= read -r -d '' file; do
+                echo "$file" >> "$current_files"
+            done < <(find "$dir" -type f -print0 2>/dev/null)
+        fi
+    done
+    
+    # Проверяем каждый текущий файл на наличие в оригинальной базе
+    while IFS= read -r file; do
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            if ! grep -q "^$(echo "$file" | sed 's/[[\.*^$()+?{|]/\\&/g')|" "$HASH_DB"; then
+                # Новый файл
+                current_hash=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+                log_message "NEW_FILE: Обнаружен новый файл: $file"
+                send_alert "$file" "NEW_FILE" "N/A" "$current_hash"
+                changes_detected=1
+            fi
+        fi
+    done < "$current_files"
+    
+    rm -f "$current_files"
+    
+    # Обновление базы хешей
+    mv "$temp_db" "$HASH_DB"
+    
+    if [ $changes_detected -eq 0 ]; then
+        log_message "Проверка завершена: изменений не обнаружено"
+    else
+        log_message "Проверка завершена: обнаружены изменения (см. выше)"
+    fi
+    
+    return $changes_detected
+}
+
+# Функция ведения истории изменений
+backup_changed_file() {
+    local file="$1"
+    local backup_dir="$BASE_DIR/backups"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="$backup_dir/$(basename "$file").$timestamp"
+    
+    if cp "$file" "$backup_file" 2>/dev/null; then
+        log_message "Создана резервная копия: $backup_file"
+    else
+        log_message "ERROR: Не удалось создать резервную копию для: $file"
+    fi
+}
+
+# Функция показа статуса
+show_status() {
+    echo "=== СТАТУС СИСТЕМЫ МОНИТОРИНГА ЦЕЛОСТНОСТИ ФАЙЛОВ ==="
+    
+    if [ -f "$HASH_DB" ] && [ -s "$HASH_DB" ]; then
+        echo "✓ База хешей существует: $HASH_DB"
+        echo "  Количество отслеживаемых файлов: $(wc -l < "$HASH_DB")"
+        echo "  Размер базы: $(du -h "$HASH_DB" | cut -f1)"
+        echo "  Последнее изменение: $(stat -c %y "$HASH_DB" 2>/dev/null || echo "N/A")"
+    else
+        echo "✗ База хешей не существует или пуста"
+        echo "  Запустите: $0 baseline"
+    fi
+    
+    echo ""
+    echo "Директория резервных копий: $BASE_DIR/backups"
+    echo "  Файлов в backups: $(find "$BASE_DIR/backups" -type f 2>/dev/null | wc -l)"
+    
+    echo ""
+    echo "Лог файл: $LOG_FILE"
+    if [ -f "$LOG_FILE" ]; then
+        echo "  Размер лога: $(du -h "$LOG_FILE" | cut -f1)"
+        echo "  Последние записи:"
+        tail -3 "$LOG_FILE" | sed 's/^/    /'
+    else
+        echo "  Лог файл не существует"
+    fi
+}
+
+# Основная логика
+case "$1" in
+    "baseline")
+        create_baseline
+        ;;
+    "check")
+        check_integrity
+        ;;
+    "auto")
+        # Автоматический режим для cron
+        if [ ! -f "$HASH_DB" ] || [ ! -s "$HASH_DB" ]; then
+            log_message "WARNING: База хешей не найдена, создаем новую..."
+            create_baseline
+        fi
+        check_integrity
+        ;;
+    "status")
+        show_status
+        ;;
+    *)
+        echo "Использование: $0 {baseline|check|auto|status}"
+        echo "  baseline - создание эталонных хешей"
+        echo "  check    - проверка целостности"
+        echo "  auto     - автоматический режим (для cron)"
+        echo "  status   - показать статус мониторинга"
+        exit 1
+        ;;
+esac
