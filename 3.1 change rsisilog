@@ -1,0 +1,19 @@
+# Модули
+module(load="imtcp")  # Для TCP
+module(load="imudp")  # Для UDP
+
+# Входные порты
+input(type="imtcp" port="514")
+input(type="imudp" port="514")
+
+# Правила для сбора (пример для разных источников)
+# Логи от серверов (например, auth.log, syslog)
+if $fromhost-ip startswith "192.168." then /var/log/central_logs/remote.log
+& stop
+
+# Логи от устройств (например, firewall)
+if $programname == "firewall" then /var/log/central_logs/firewall.log
+& stop
+
+# Общие логи
+*.* /var/log/central_logs/all.log
