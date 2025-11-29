@@ -127,9 +127,7 @@ function detect_and_respond() {
     if [[ -f "$playbook_file" ]]; then
         run_playbook "$playbook_file" "$context" "$confidence"
     else
-
-Андрюша 2, [29.11.2025 10:21]
-log "error" "No playbook found for $incident_type"
+    log "error" "No playbook found for $incident_type"
     fi
 }
 
