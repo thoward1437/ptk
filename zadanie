@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Проверка, запущен ли скрипт с правами root (необходимо для usermod)
+if [[ $EUID -ne 0 ]]; then
+   echo "Этот скрипт должен быть запущен с правами root (sudo)." >&2
+   exit 1
+fi
+
+# Запрос имени пользователя
+read -p "Введите имя пользователя для блокировки на неделю: " username
+
+# Проверка, существует ли пользователь
+if ! id "$username" &>/dev/null; then
+    echo "Пользователь '$username' не существует." >&2
+    exit 1
+fi
+
+# Вычисление даты через неделю в формате YYYY-MM-DD
+expire_date=$(date -d "+7 days" +%Y-%m-%d)
+
+# Блокировка пользователя путем установки даты истечения аккаунта
+usermod --expiredate "$expire_date" "$username"
+
+if [[ $? -eq 0 ]]; then
+    echo "Пользователь '$username' заблокирован до $expire_date."
+else
+    echo "Ошибка при блокировке пользователя '$username'." >&2
+    exit 1
+fi
